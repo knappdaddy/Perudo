@@ -1,0 +1,9 @@
+# One-click deploy on Render: https://render.com/deploy
+services:
+  - type: web
+    name: perudo
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /healthz

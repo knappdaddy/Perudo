@@ -1,0 +1,11 @@
+{
+  "name": "Perudo!",
+  "short_name": "Perudo",
+  "description": "Liar's dice for you and your friends' phones.",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#2b1145",
+  "theme_color": "#2b1145",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}
