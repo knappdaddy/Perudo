@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { countFace, isValidBid, minQty, probAtLeast } from '../public/rules.js';
+import { countFace, isValidBid, minQty, probAtLeast } from '../public/game/rules.js';
 
 test('opening bids: anything but aces, unless palifico', () => {
   assert.equal(minQty(null, 3), 1);

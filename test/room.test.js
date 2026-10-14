@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Room, GameError } from '../server/room.js';
+import { Room, GameError } from '../public/game/room.js';
 
 // Deterministic RNG so tests are repeatable.
 function seeded(seed = 42) {

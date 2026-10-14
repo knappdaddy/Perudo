@@ -2,7 +2,7 @@
   "name": "Perudo!",
   "short_name": "Perudo",
   "description": "Liar's dice for you and your friends' phones.",
-  "start_url": "/",
+  "start_url": "./",
   "display": "standalone",
   "orientation": "portrait",
   "background_color": "#2b1145",

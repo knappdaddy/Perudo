@@ -1,4 +1,6 @@
-import { minQty } from './rules.js';
+import { minQty } from './game/rules.js';
+import config from './config.js';
+import { createNet } from './net.js';
 
 const AVATARS = ['🦙', '🦜', '🐸', '🐙', '🦊', '🐼', '🦖', '🐌', '🦩', '🌵', '🌶️', '👽', '🐧', '🦔', '🐝', '🍄'];
 const EMOTES = ['😂', '🤥', '🤨', '🔥', '😱', '🦙', '👏', '💀'];
@@ -51,41 +53,24 @@ const ui = {
 
 // ---------- networking ----------
 
-let ws = null;
-let retry = 0;
-let outbox = [];
+// Works at the domain root or in a subfolder (e.g. username.github.io/Perudo/).
+const BASE = location.pathname.replace(/[^/]*$/, '');
+const inviteUrl = (code) => `${location.origin}${BASE}?room=${code}`;
 
-function connect() {
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
-  ws.onopen = () => {
-    retry = 0;
-    $conn.hidden = true;
-    if (session) ws.send(JSON.stringify({ t: 'resume', ...session }));
-    for (const m of outbox) ws.send(JSON.stringify(m));
-    outbox = [];
-  };
-  ws.onmessage = (ev) => onMessage(JSON.parse(ev.data));
-  ws.onclose = () => {
-    if (state) $conn.hidden = false;
-    setTimeout(connect, Math.min(8000, 500 * 2 ** retry++));
-  };
-}
-
-function send(msg) {
-  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
-  else {
-    outbox.push(msg);
-    connect();
-  }
-}
+const net = createNet({
+  config,
+  onMessage,
+  onStatus: (ok) => ($conn.hidden = ok || !state),
+});
+const send = (msg) => net.send(msg);
 
 function onMessage(msg) {
   switch (msg.t) {
     case 'joined':
-      session = { code: msg.code, token: msg.token };
+      session = { code: msg.code, token: msg.token, host: net.isHost() };
       store.set('session', session);
-      history.replaceState(null, '', `/?room=${msg.code}`);
+      net.setSession(session);
+      history.replaceState(null, '', `${BASE}?room=${msg.code}`);
       break;
     case 'state': {
       const prev = state;
@@ -111,8 +96,10 @@ function onMessage(msg) {
 function leaveLocal() {
   session = null;
   store.set('session', null);
+  net.setSession(null);
   state = null;
-  history.replaceState(null, '', '/');
+  $conn.hidden = true;
+  history.replaceState(null, '', BASE);
   render();
 }
 
@@ -130,7 +117,7 @@ function effects(prev, next) {
     sfx.call(next.result.type);
     navigator.vibrate?.(120);
   }
-  if (next.phase !== 'lobby') wakeLock();
+  if (next.phase !== 'lobby' || net.isHost()) wakeLock();
 }
 
 // ---------- actions ----------
@@ -160,7 +147,7 @@ const actions = {
     render();
   },
   share: async () => {
-    const url = `${location.origin}/?room=${state.code}`;
+    const url = inviteUrl(state.code);
     try {
       if (navigator.share) await navigator.share({ title: 'Perudo!', text: `Come lie to me. Room ${state.code} 🎲`, url });
       else {
@@ -320,7 +307,7 @@ function homeView() {
         <input class="field code grow" name="code" maxlength="4" autocapitalize="characters" autocomplete="off" placeholder="ABCD" value="${esc(ui.joinCode)}">
         <button class="btn teal" data-act="join">Join →</button>
       </div>
-      ${invited ? `<p class="small muted center" style="margin:12px 0 0">…or <a href="/" onclick="history.replaceState(null,'','/')">start your own room</a></p>` : ''}
+      ${invited ? `<p class="small muted center" style="margin:12px 0 0">…or <a href="${BASE}">start your own room</a></p>` : ''}
     </section>
 
     <p class="center"><button class="btn paper sm" data-act="rules">📜 How to play</button></p>
@@ -353,6 +340,10 @@ function lobbyView() {
       <button class="btn sky block" data-act="share">📣 Invite your friends</button>
     </section>
 
+    ${net.isHost() && config.mode === 'p2p' ? `
+    <div class="palibanner hostnote"><b>📌 You're the table!</b>
+      The game runs on this phone, so keep this screen open until the last die is rolled.
+    </div>` : ''}
     <section class="card tilt-l">
       <h2>Players (${state.players.length}/8)</h2>
       <ul class="plist">
@@ -661,7 +652,7 @@ function drawQR() {
   if (!el || !window.qrcode) return;
   try {
     const qr = window.qrcode(0, 'M');
-    qr.addData(`${location.origin}/?room=${state.code}`);
+    qr.addData(inviteUrl(state.code));
     qr.make();
     el.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 0, scalable: true });
     el.hidden = false;
@@ -717,8 +708,8 @@ async function wakeLock() {
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
-  connect();
-  if (state && state.phase !== 'lobby') wakeLock();
+  net.wake();
+  if (state && (state.phase !== 'lobby' || net.isHost())) wakeLock();
 });
 
 // Tiny synth sounds — no audio files needed.
@@ -764,4 +755,4 @@ if (session && urlRoom && urlRoom !== session.code) {
 }
 
 render();
-connect();
+if (session) net.resume(session);

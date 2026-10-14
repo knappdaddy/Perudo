@@ -1,6 +1,6 @@
 // A simple probabilistic Perudo bot. It only knows its own dice and the
 // number of dice on the table, like a human would.
-import { FACES, minQty, probAtLeast, probExactly } from '../public/rules.js';
+import { FACES, minQty, probAtLeast, probExactly } from './rules.js';
 
 export const BOT_NAMES = [
   'Señor Bluff', 'Lady Paco', 'Dice Daddy', 'Count Dudo', 'Captain Cup',

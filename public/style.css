@@ -363,6 +363,7 @@ input { font: inherit; }
   background: var(--pink); border: var(--line); border-radius: 14px; padding: 10px 12px; margin: 12px 0; box-shadow: var(--shadow);
   font-weight: 700; transform: rotate(-1deg);
 }
+.palibanner.hostnote { background: var(--lime); transform: rotate(.8deg); }
 .palibanner b { font-family: var(--display); font-weight: 400; font-size: 18px; display: block; }
 
 .hand { background: var(--paper2); }

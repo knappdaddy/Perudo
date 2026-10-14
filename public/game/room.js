@@ -1,5 +1,4 @@
-import { randomUUID } from 'node:crypto';
-import { countFace, isValidBid, minQty, rollDice } from '../public/rules.js';
+import { countFace, isValidBid, minQty, rollDice } from './rules.js';
 import { decide, BOT_NAMES } from './bot.js';
 
 export const MAX_PLAYERS = 8;
@@ -11,6 +10,12 @@ const DEFAULT_TIMING = {
   afk: 40000, // a disconnected player's turn is auto-played after this
   reveal: 20000, // the reveal screen auto-advances after this
 };
+
+// Works in Node and in browsers (even on plain-http LAN pages, where crypto.randomUUID is missing).
+function uid(bytes = 16) {
+  const a = crypto.getRandomValues(new Uint8Array(bytes));
+  return Array.from(a, (b) => b.toString(16).padStart(2, '0')).join('');
+}
 
 export class GameError extends Error {}
 const fail = (msg) => {
@@ -41,8 +46,8 @@ export class Room {
     if (this.phase !== 'lobby') fail('That game has already started.');
     if (this.players.length >= MAX_PLAYERS) fail('That room is full.');
     const player = {
-      id: randomUUID().slice(0, 8),
-      token: randomUUID(),
+      id: uid(4),
+      token: uid(),
       name: cleanName(name) || 'Mystery Guest',
       avatar: AVATARS.includes(avatar) ? avatar : AVATARS[this.players.length % AVATARS.length],
       isBot,
@@ -313,6 +318,38 @@ export class Room {
   destroy() {
     clearTimeout(this.timer);
     this.timer = null;
+  }
+
+  // ---------- persistence (lets a browser host survive a page reload) ----------
+
+  snapshot() {
+    return {
+      code: this.code,
+      players: this.players.map(({ client, ...p }) => p),
+      hostId: this.hostId,
+      phase: this.phase,
+      settings: this.settings,
+      round: this.round,
+      result: this.result,
+      winnerId: this.winnerId,
+      ready: [...this.ready],
+    };
+  }
+
+  static restore(snap, opts) {
+    const room = new Room(snap.code, opts);
+    Object.assign(room, {
+      players: snap.players.map((p) => ({ ...p, connected: p.isBot })),
+      hostId: snap.hostId,
+      phase: snap.phase,
+      settings: snap.settings,
+      round: snap.round,
+      result: snap.result,
+      winnerId: snap.winnerId,
+      ready: new Set(snap.ready),
+    });
+    room.schedule();
+    return room;
   }
 
   // ---------- helpers ----------

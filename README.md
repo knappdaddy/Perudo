@@ -2,6 +2,8 @@
 
 Liar's dice for liars & llamas. It's a multiplayer, phone-first take on Perudo that you play in the browser. There's nothing to install: one person makes a room, everyone else scans the QR code or taps the invite link, and the lying begins.
 
+**▶ Play: https://knappdaddy.github.io/Perudo/**
+
 ## Features
 
 - **Rooms with 4-letter codes**, invite links and a QR code for friends sitting at the same table
@@ -10,39 +12,53 @@ Liar's dice for liars & llamas. It's a multiplayer, phone-first take on Perudo t
 - **Bots** to fill empty seats (2–8 players in total)
 - **Made for phones**: big tap targets, a confirm tap on Dudo and Calza so you can't call one by accident, a "hide my dice" cup for nosy neighbours, buzz on your turn, and a screen that stays awake while you play
 - **Survives flaky connections**: if your phone locks or drops signal you get your seat back on reconnect. If you're gone for 40 seconds on your turn, a bot plays it for you.
+- **No server needed**: it runs on GitHub Pages, peer-to-peer
 - **Emote reactions** (🤥 😂 🔥 …), synthesized sound effects with a mute button, and confetti for the winner
-- The server deals and resolves every round, so nobody can peek at other players' dice from their browser
+- The host (or the server) deals and resolves every round, and only sends each phone its own dice, so guests can't peek at other players' dice from their browser
+
+## Play it
+
+**https://knappdaddy.github.io/Perudo/** is hosted free on GitHub Pages, with no server.
+
+On GitHub Pages the game runs **peer-to-peer**: whoever taps *New room* hosts the game in their own browser, and friends' phones connect straight to it over WebRTC. [PeerJS](https://peerjs.com)'s free cloud service only introduces the phones to each other (plus a relay for networks that block direct connections). Some things to know:
+
+- **The host keeps their screen open.** The game lives on the host's phone. If the host reloads, the game is restored from their phone's storage and everyone reconnects automatically. If the host locks their phone for a while, other players freeze until the host comes back.
+- If a guest's phone locks or reloads, they get their seat back. If a guest is gone for 40 seconds on their turn, a bot plays it for them.
+
+Every push to `main` that touches `public/` redeploys the site through `.github/workflows/pages.yml`.
 
 ## Run it locally
 
+Any static file server works, because `public/` is the whole app:
+
 ```bash
-npm install
-npm start          # → http://localhost:3000
+npx serve public          # peer-to-peer mode, just like GitHub Pages
 ```
 
-To play with phones on the same Wi-Fi, open `http://<your-computer's-LAN-IP>:3000` on each phone.
+There's also an optional Node server that runs every room centrally over WebSockets. It's sturdier, since nobody's phone has to stay awake, but it needs a host that runs Node (Render, Fly, Railway; there's a `render.yaml` and a `Dockerfile`):
 
-`npm run dev` restarts the server on file changes. `npm test` runs the rules, game-flow and WebSocket tests.
+```bash
+npm install
+npm start                 # → http://localhost:3000 (server mode)
+```
 
-## Put it on the internet
-
-It's one small Node process (HTTP and WebSockets on the same port) with no database, so any Node host works. Rooms live in memory, so a restart or redeploy ends any games in progress.
-
-- **Render**: push this repo to GitHub, then choose *New → Blueprint* and pick the repo. `render.yaml` sets everything up. The free tier sleeps when idle, so the first visit after a break takes about 30 seconds.
-- **Fly.io / Railway / anything with Docker**: use the included `Dockerfile`. The app listens on `$PORT`.
-
-Run a **single instance**: rooms aren't shared between servers.
+`npm test` runs the rules, game-flow and WebSocket tests.
 
 ## How it's built
 
 ```
-server/index.js   HTTP static server + WebSocket hub (ws)
-server/room.js    Game state machine: lobby → bidding → reveal → game over
-server/bot.js     Probability-based bot (it only sees its own dice)
-public/rules.js   Bid/count rules, shared by the server and the browser
-public/app.js     Vanilla-JS client, no build step
-public/style.css  The look: chunky outlines, hard shadows, Andean zigzags
+public/game/rules.js  Bid/count rules
+public/game/room.js   Game state machine: lobby → bidding → reveal → game over
+public/game/bot.js    Probability-based bot (it only sees its own dice)
+public/game/hub.js    Routes players' messages to rooms, over any transport
+public/net.js         The browser's link: WebRTC peer-to-peer, or WebSocket to the server
+public/config.js      Picks the mode ('p2p' by default; the Node server overrides it)
+public/app.js         Vanilla-JS UI, no build step
+public/style.css      The look: chunky outlines, hard shadows, Andean zigzags
+server/index.js       Optional Node server (static files + WebSockets)
 ```
+
+The same game engine (`public/game/`) runs on the Node server or in the host's browser.
 
 ## Rules in 30 seconds
 
