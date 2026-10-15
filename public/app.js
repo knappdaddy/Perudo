@@ -38,6 +38,7 @@ let session = store.get('session', null); // { code, token }
 let state = null;
 const ui = {
   joinCode: '',
+  busy: null, // 'create' | 'join' while we're connecting
   pick: null,
   pickKey: null,
   hideDice: store.get('hideDice', false),
@@ -73,6 +74,7 @@ function onMessage(msg) {
       history.replaceState(null, '', `${BASE}?room=${msg.code}`);
       break;
     case 'state': {
+      setBusy(null);
       const prev = state;
       state = msg.state;
       effects(prev, state);
@@ -81,9 +83,11 @@ function onMessage(msg) {
     }
     case 'error':
       toast(msg.msg);
+      if (ui.busy) setBusy(null);
       break;
     case 'gone':
     case 'kicked':
+      setBusy(null);
       if (msg.t === 'kicked' || state) toast(msg.msg || 'That game is over — start a new one!');
       leaveLocal();
       break;
@@ -120,6 +124,22 @@ function effects(prev, next) {
   if (next.phase !== 'lobby' || net.isHost()) wakeLock();
 }
 
+// Show that Create/Join are working, and never leave them stuck.
+let busyTimer = null;
+function setBusy(kind) {
+  if (ui.busy === kind) return;
+  ui.busy = kind;
+  clearTimeout(busyTimer);
+  if (kind) {
+    busyTimer = setTimeout(() => {
+      if (!ui.busy || state) return;
+      toast("Still can't connect. Check your internet and the room code, then try again.");
+      setBusy(null);
+    }, 45000);
+  }
+  if (!state) render();
+}
+
 // ---------- actions ----------
 
 const actions = {
@@ -129,13 +149,15 @@ const actions = {
     render();
   },
   create: () => {
-    if (!checkName()) return;
+    if (ui.busy || !checkName()) return;
+    setBusy('create');
     send({ t: 'create', name: me.name, avatar: me.avatar });
   },
   join: () => {
-    if (!checkName()) return;
+    if (ui.busy || !checkName()) return;
     const code = ui.joinCode.trim().toUpperCase();
     if (code.length !== 4) return toast('Room codes are 4 letters.');
+    setBusy('join');
     send({ t: 'join', code, name: me.name, avatar: me.avatar });
   },
   rules: () => {
@@ -298,14 +320,14 @@ function homeView() {
     ${invited ? '' : `
     <section class="card tilt-r">
       <h2>Start a table</h2>
-      <button class="btn pink big block" data-act="create">🎲 New room</button>
+      <button class="btn pink big block" data-act="create" ${ui.busy ? 'disabled' : ''}>${ui.busy === 'create' ? '🎲 Setting up the table…' : '🎲 New room'}</button>
     </section>`}
 
     <section class="card ${invited ? 'tilt-r' : 'tilt-l'}">
       <h2>${invited ? "You've been invited!" : 'Got a code?'}</h2>
       <div class="row">
         <input class="field code grow" name="code" maxlength="4" autocapitalize="characters" autocomplete="off" placeholder="ABCD" value="${esc(ui.joinCode)}">
-        <button class="btn teal" data-act="join">Join →</button>
+        <button class="btn teal" data-act="join" ${ui.busy ? 'disabled' : ''}>${ui.busy === 'join' ? 'Connecting…' : 'Join →'}</button>
       </div>
       ${invited ? `<p class="small muted center" style="margin:12px 0 0">…or <a href="${BASE}">start your own room</a></p>` : ''}
     </section>
@@ -665,7 +687,7 @@ function toast(text) {
   el.className = 'toast';
   el.textContent = text;
   $toasts.appendChild(el);
-  setTimeout(() => el.remove(), 3200);
+  setTimeout(() => el.remove(), 2500 + text.length * 45);
 }
 
 function floatEmote(pid, e) {

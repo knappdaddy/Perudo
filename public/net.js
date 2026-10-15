@@ -1,18 +1,25 @@
 // The app's only link to other players. Two flavours, same interface:
 //   server – a WebSocket to the Node server, which runs the rooms.
-//   p2p    – no server: whoever creates a room runs it in their own browser
-//            (the same hub/room code the server uses) and friends connect to
-//            them over WebRTC data channels. PeerJS's free cloud broker is
-//            only used to introduce phones to each other.
+//   relay  – no server of our own (GitHub Pages): whoever creates a room runs
+//            it in their own browser (the same hub/room code the server uses),
+//            and phones swap messages through free public MQTT brokers over
+//            secure WebSockets, which get through practically any network.
 import { createHub, randomCode } from './game/hub.js';
+import { connectMqtt } from './mqtt-lite.js';
 
-const PEER_PREFIX = 'perudo-knappdaddy-v1-';
+const TOPIC_ROOT = 'perudo-knappdaddy/v2';
+const DEFAULT_BROKERS = [
+  'wss://broker.emqx.io:8084/mqtt',
+  'wss://broker.hivemq.com:8884/mqtt',
+  'wss://mqtt.eclipseprojects.io/mqtt', // port 443, for networks that block odd ports
+];
 const PING_MS = 4000;
 const DEAD_MS = 15000;
+const FIND_HOST_MS = 5000;
 
 export function createNet({ config, onMessage, onStatus }) {
   const deliver = (msg) => queueMicrotask(() => onMessage(msg));
-  return config.mode === 'server' ? serverNet(deliver, onStatus) : p2pNet(config, deliver, onStatus);
+  return config.mode === 'server' ? serverNet(deliver, onStatus) : relayNet(config, deliver, onStatus);
 }
 
 // ---------------------------------------------------------------------------
@@ -65,22 +72,6 @@ function serverNet(deliver, onStatus) {
 
 // ---------------------------------------------------------------------------
 
-let peerLib = null;
-function loadPeerJS() {
-  peerLib ??= new Promise((resolve, reject) => {
-    if (window.Peer) return resolve(window.Peer);
-    const s = document.createElement('script');
-    s.src = new URL('vendor/peerjs.min.js', import.meta.url).href;
-    s.onload = () => resolve(window.Peer);
-    s.onerror = () => {
-      peerLib = null;
-      reject(new Error('Could not load PeerJS'));
-    };
-    document.head.appendChild(s);
-  });
-  return peerLib;
-}
-
 const SAVE_KEY = 'perudo:hostedRoom';
 const saveRoom = (snap) => {
   try {
@@ -100,215 +91,256 @@ const clearRoom = () => {
   } catch {}
 };
 
-function p2pNet(config, deliver, onStatus) {
-  const peerOpts = { debug: 0, ...(config.peer || {}) };
-  let peer = null;
-  let host = null; // { code, hub, local, clients:Set, timer }
-  let guest = null; // { code, first, joined, conn, outbox, failures, gotState, lastSeen, timer, retryTimer }
+function randomId() {
+  const a = crypto.getRandomValues(new Uint8Array(6));
+  return Array.from(a, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Topics: guests write to <room>/host; the host answers each guest on <room>/c/<guestId>.
+const hostTopic = (code) => `${TOPIC_ROOT}/${code}/host`;
+const guestTopic = (code, id) => `${TOPIC_ROOT}/${code}/c/${id}`;
+
+function relayNet(config, deliver, onStatus) {
+  const brokers = config.brokers?.length ? config.brokers : DEFAULT_BROKERS;
+  const myId = randomId(); // this tab's address on the relay
+  let host = null;
+  let guest = null;
 
   const fail = (msg) => deliver({ t: 'error', msg });
-
-  function newPeer(id) {
-    return loadPeerJS().then((Peer) => {
-      const p = id ? new Peer(id, peerOpts) : new Peer(peerOpts);
-      p.on('disconnected', () => {
-        if (p === peer) onStatus(false);
-        if (p === peer && !p.destroyed) setTimeout(() => p === peer && !p.destroyed && p.reconnect(), 2000);
-      });
-      return p;
-    });
-  }
 
   function teardown() {
     if (host) {
       clearInterval(host.timer);
       host.hub.destroyAll();
+      for (const mq of host.conns.values()) mq.close();
     }
     if (guest) {
       clearInterval(guest.timer);
-      clearTimeout(guest.retryTimer);
-      guest.conn?.close();
+      guest.mq?.close();
     }
     host = guest = null;
-    peer?.destroy();
-    peer = null;
     onStatus(true);
   }
 
-  // ----- hosting -----
+  // ----- hosting: run the room here and listen on every broker at once -----
 
-  // Create (or restore) the room locally, then register its code with the broker
-  // so guests can find us. A fresh room retries with a new code if one is taken.
   async function startHosting({ first, snapshot }) {
     teardown();
     const code = snapshot?.code || randomCode();
     const local = { open: true, local: true, send: deliver, close() {} };
-    const hub = createHub({
+    const h = { code, local, conns: new Map(), clients: new Map(), retrying: new Set() };
+    h.hub = createHub({
       newCode: () => code,
       canCreate: (c) => c === local,
-      onRoomChange: (room) => host?.hub === hub && saveRoom(room.snapshot()),
+      onRoomChange: (room) => host === h && saveRoom(room.snapshot()),
     });
-    host = { code, hub, local, first, clients: new Set() };
-    host.timer = setInterval(heartbeat, PING_MS);
-    if (snapshot) hub.restore(snapshot);
-    openHostPeer(host, () => {
-      if (!snapshot && host.hub.rooms.size === 0) hub.receive(local, first);
-    }, !snapshot);
-    if (snapshot) hub.receive(local, first);
-  }
-
-  async function openHostPeer(h, onOpen, fresh, attempt = 0) {
-    let p;
+    host = h;
+    h.timer = setInterval(() => hostHeartbeat(h), PING_MS);
+    if (snapshot) {
+      h.hub.restore(snapshot);
+      h.hub.receive(local, first);
+    }
     try {
-      p = await newPeer(PEER_PREFIX + h.code);
+      // Ready as soon as any broker answers; the rest keep connecting in the background.
+      await Promise.any(
+        brokers.map((url) =>
+          hostBroker(h, url).catch((err) => {
+            reconnectHostBroker(h, url);
+            throw err;
+          }),
+        ),
+      );
     } catch {
-      return fail("Couldn't load the multiplayer bits. Check your connection?");
-    }
-    if (host !== h) return p.destroy();
-    peer = p;
-    p.on('open', () => {
-      onStatus(true);
-      onOpen();
-    });
-    p.on('connection', (conn) => host === h && wireGuest(h, conn));
-    p.on('error', (err) => {
       if (host !== h) return;
-      if (err.type === 'unavailable-id') {
-        p.destroy();
-        if (fresh && h.hub.rooms.size === 0) {
-          // Someone somewhere already has this code — roll a new one.
-          host = null;
-          clearInterval(h.timer);
-          return startHosting({ first: h.first });
-        }
-        // Our own old registration hasn't expired yet (page reload) — keep trying.
-        return setTimeout(() => host === h && openHostPeer(h, onOpen, false, attempt + 1), 3000);
+      if (!snapshot) {
+        teardown();
+        return fail("Couldn't reach the game relay. Check your internet and try again?");
       }
-      if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(err.type)) {
-        onStatus(false);
-        return;
-      }
-      if (err.type === 'browser-incompatible') fail("This browser can't do peer-to-peer. Try Chrome or Safari?");
-    });
+      onStatus(false);
+    }
+    if (host === h && !snapshot) h.hub.receive(local, first);
   }
 
-  function wireGuest(h, conn) {
-    const client = {
-      open: false,
-      lastSeen: Date.now(),
-      send: (m) => conn.open && conn.send(m),
-      close: () => setTimeout(() => conn.close(), 300),
-    };
-    h.clients.add(client);
-    const gone = () => {
-      if (!h.clients.delete(client)) return;
-      h.hub.disconnect(client);
-    };
-    conn.on('open', () => (client.open = true));
-    conn.on('data', (m) => {
-      client.open = true;
-      client.lastSeen = Date.now();
-      if (m?.t !== 'ping') h.hub.receive(client, m);
+  async function hostBroker(h, url) {
+    const mq = await connectMqtt(url, { clientId: `pk${myId}h` });
+    if (host !== h) {
+      mq.close();
+      throw new Error('stale');
+    }
+    h.conns.set(url, mq);
+    onStatus(true);
+    mq.subscribe(hostTopic(h.code));
+    mq.onMessage((_topic, text) => hostReceive(h, mq, text));
+    mq.onClose(() => {
+      h.conns.delete(url);
+      if (host === h && h.conns.size === 0) onStatus(false);
+      reconnectHostBroker(h, url);
     });
-    conn.on('close', gone);
-    conn.on('error', gone);
-    client.drop = () => {
-      conn.close();
-      gone();
-    };
+    return mq;
   }
 
-  function heartbeat() {
-    if (!host) return;
-    const now = Date.now();
-    for (const c of host.clients) {
-      if (now - c.lastSeen > DEAD_MS) c.drop();
-      else c.send({ t: 'ping' });
+  async function reconnectHostBroker(h, url) {
+    if (h.retrying.has(url)) return;
+    h.retrying.add(url);
+    try {
+      for (let delay = 2000; host === h && !h.conns.has(url); delay = Math.min(delay * 2, 30000)) {
+        await sleep(delay);
+        if (host !== h || h.conns.has(url)) return;
+        try {
+          await hostBroker(h, url);
+        } catch {}
+      }
+    } finally {
+      h.retrying.delete(url);
     }
   }
 
-  // ----- joining -----
+  function hostReceive(h, mq, text) {
+    if (host !== h) return;
+    let env;
+    try {
+      env = JSON.parse(text);
+    } catch {
+      return;
+    }
+    const from = env?.from;
+    const m = env?.m;
+    if (typeof from !== 'string' || from.length > 32 || !m || typeof m !== 'object') return;
+    let c = h.clients.get(from);
+    if (!c) {
+      c = {
+        id: from,
+        open: true,
+        send: (msg) => c.mq.connected && c.mq.publish(guestTopic(h.code, from), JSON.stringify(msg)),
+        close: () => h.clients.delete(from),
+      };
+      h.clients.set(from, c);
+    }
+    c.mq = mq; // answer on whichever broker they last used
+    c.open = true;
+    c.lastSeen = Date.now();
+    const attached = c.ctx && c.ctx.player.client === c;
+    // A slow reply can make a guest repeat its hello on another broker — don't seat them twice.
+    if (m.t === 'join' && attached) return;
+    if (m.t === 'ping') {
+      // A guest we don't know (we reloaded, or they did) — ask them who they are.
+      if (!attached) c.send({ t: 'who' });
+      return;
+    }
+    h.hub.receive(c, m);
+  }
+
+  function hostHeartbeat(h) {
+    const now = Date.now();
+    for (const [id, c] of h.clients) {
+      if (now - c.lastSeen > DEAD_MS) {
+        h.hub.disconnect(c);
+        h.clients.delete(id);
+      } else c.send({ t: 'ping' });
+    }
+  }
+
+  // ----- joining: find the host on one of the brokers -----
 
   async function joinRoom(code, first, session = null) {
     teardown();
-    guest = { code, first, session, joined: !!session, outbox: [], failures: 0, gotState: false, lastSeen: Date.now() };
-    const g = guest;
-    let p;
-    try {
-      p = await newPeer();
-    } catch {
-      return fail("Couldn't load the multiplayer bits. Check your connection?");
+    const g = { code, first, session, joined: !!session, gotState: false, lastSeen: 0, mq: null, outbox: [], misses: 0 };
+    guest = g;
+    g.timer = setInterval(() => guestHeartbeat(g), PING_MS);
+    const found = await findHost(g);
+    if (guest !== g || found === true) return;
+    if (!g.joined) {
+      teardown();
+      return fail(
+        found === 'no-relay'
+          ? "Couldn't reach the game relay. Check your internet and try again?"
+          : `No room ${code} answered. Check the code, and make sure the host's screen is still on.`,
+      );
     }
-    if (guest !== g) return p.destroy();
-    peer = p;
-    p.on('open', () => connectToHost(g));
-    p.on('error', (err) => {
-      if (guest !== g) return;
-      if (err.type === 'peer-unavailable') {
-        g.failures++;
-        if (!g.joined) {
-          teardown();
-          return fail("Can't find that room. Is the host's screen still on?");
-        }
-        if (!g.gotState && g.failures >= 3) {
-          teardown();
-          return deliver({ t: 'gone' });
-        }
-        if (g.failures >= 40) {
-          teardown();
-          return deliver({ t: 'kicked', msg: 'Lost the host for good. 😢 Start a new room?' });
-        }
-        return retry(g);
-      }
-      if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(err.type)) {
-        onStatus(false);
-        return retry(g);
-      }
-      if (err.type === 'browser-incompatible') fail("This browser can't do peer-to-peer. Try Chrome or Safari?");
-    });
-    g.timer = setInterval(() => {
-      if (!g.conn?.open) return;
-      if (Date.now() - g.lastSeen > DEAD_MS) {
-        g.conn.close();
-        return;
-      }
-      g.conn.send({ t: 'ping' });
-    }, PING_MS);
+    onStatus(false); // resuming: keep looking — the host may be reloading
   }
 
-  function retry(g) {
-    onStatus(false);
-    clearTimeout(g.retryTimer);
-    g.retryTimer = setTimeout(() => guest === g && connectToHost(g), Math.min(5000, 1000 + g.failures * 500));
+  // Try each broker in turn: connect, say hello, wait briefly for the host.
+  async function findHost(g) {
+    if (g.searching) return g.searching;
+    g.searching = (async () => {
+      let anyBroker = false;
+      for (const url of brokers) {
+        if (guest !== g) return false;
+        let mq;
+        try {
+          mq = await connectMqtt(url, { clientId: `pk${myId}g` });
+        } catch {
+          continue;
+        }
+        anyBroker = true;
+        if (guest !== g) return mq.close(), false;
+        mq.subscribe(guestTopic(g.code, myId));
+        mq.onMessage((_t, text) => guestReceive(g, mq, text));
+        const heardAt = g.lastSeen;
+        const tell = (m) => mq.publish(hostTopic(g.code), JSON.stringify({ from: myId, m }));
+        tell(g.joined && g.session ? { t: 'resume', ...g.session } : g.first);
+        for (let waited = 0; waited < FIND_HOST_MS && g.lastSeen === heardAt && guest === g; waited += 100) await sleep(100);
+        if (guest === g && g.lastSeen !== heardAt) {
+          if (g.mq && g.mq !== mq) g.mq.close();
+          g.mq = mq;
+          mq.onClose(() => guest === g && g.mq === mq && (onStatus(false), findHost(g)));
+          for (const m of g.outbox.splice(0)) tell(m);
+          return true;
+        }
+        mq.close();
+      }
+      return anyBroker ? 'no-host' : 'no-relay';
+    })();
+    try {
+      return await g.searching;
+    } finally {
+      g.searching = null;
+    }
   }
 
-  function connectToHost(g) {
-    if (guest !== g || !peer) return;
-    if (peer.disconnected && !peer.destroyed) peer.reconnect();
-    const conn = peer.connect(PEER_PREFIX + g.code, { reliable: true, serialization: 'json' });
-    g.conn = conn;
-    conn.on('open', () => {
-      if (guest !== g) return conn.close();
-      onStatus(true);
-      g.lastSeen = Date.now();
-      conn.send(g.joined && g.session ? { t: 'resume', ...g.session } : g.first);
-      for (const m of g.outbox) conn.send(m);
-      g.outbox = [];
-    });
-    conn.on('data', (m) => {
-      if (guest !== g) return;
-      g.lastSeen = Date.now();
-      g.failures = 0;
-      if (m?.t === 'ping') return;
-      if (m.t === 'joined') g.joined = true;
-      if (m.t === 'state') g.gotState = true;
-      if (m.t === 'kicked' || m.t === 'gone') {
-        deliver(m);
-        return teardown();
+  function guestReceive(g, mq, text) {
+    if (guest !== g) return;
+    let m;
+    try {
+      m = JSON.parse(text);
+    } catch {
+      return;
+    }
+    g.lastSeen = Date.now();
+    if (g.mq === mq) onStatus(true);
+    if (m.t === 'ping') return;
+    if (m.t === 'who') {
+      const hello = g.joined && g.session ? { t: 'resume', ...g.session } : g.first;
+      if (hello) mq.publish(hostTopic(g.code), JSON.stringify({ from: myId, m: hello }));
+      return;
+    }
+    if (m.t === 'joined') g.joined = true;
+    if (m.t === 'state') g.gotState = true;
+    deliver(m);
+    if (m.t === 'kicked' || m.t === 'gone' || (m.t === 'error' && !g.joined)) teardown();
+  }
+
+  function guestHeartbeat(g) {
+    if (guest !== g || g.searching) return;
+    if (g.mq?.connected) g.mq.publish(hostTopic(g.code), JSON.stringify({ from: myId, m: { t: 'ping' } }));
+    const silent = Date.now() - g.lastSeen;
+    if (g.mq && silent > DEAD_MS) onStatus(false);
+    // Never found the host, or it's gone quiet: maybe it's reloading or on another broker. Go looking.
+    if (!g.mq?.connected || silent > DEAD_MS * 2) {
+      g.misses++;
+      if (!g.gotState && g.misses >= 3) {
+        teardown();
+        return deliver({ t: 'gone' });
       }
-      deliver(m);
-    });
-    conn.on('close', () => guest === g && g.conn === conn && retry(g));
+      if (g.misses >= 40) {
+        teardown();
+        return deliver({ t: 'kicked', msg: 'Lost the host for good. 😢 Start a new room?' });
+      }
+      findHost(g).then((ok) => ok === true && (g.misses = 0));
+    }
   }
 
   return {
@@ -321,27 +353,27 @@ function p2pNet(config, deliver, onStatus) {
           const h = host;
           host = null; // stop handling messages now; let the goodbyes flush first
           return setTimeout(() => {
-            if (host || guest) return clearInterval(h.timer), h.hub.destroyAll();
-            host = h;
-            teardown();
-          }, 400);
+            clearInterval(h.timer);
+            h.hub.destroyAll();
+            for (const mq of h.conns.values()) mq.close();
+          }, 500);
         }
         return host.hub.receive(host.local, msg);
       }
       if (msg.t === 'create') return startHosting({ first: msg });
       if (msg.t === 'join') return joinRoom(String(msg.code).toUpperCase(), msg);
-      if (!guest) return;
+      const g = guest;
+      if (!g) return;
+      const wrapped = JSON.stringify({ from: myId, m: msg });
+      if (g.mq?.connected && !g.searching) g.mq.publish(hostTopic(g.code), wrapped);
+      else g.outbox.push(msg);
       if (msg.t === 'leave') {
-        guest.conn?.open && guest.conn.send(msg);
-        const g = guest;
         guest = null;
-        return setTimeout(() => {
-          guest = g;
-          teardown();
-        }, 300);
+        setTimeout(() => {
+          clearInterval(g.timer);
+          g.mq?.close();
+        }, 500);
       }
-      if (guest.conn?.open) guest.conn.send(msg);
-      else guest.outbox.push(msg);
     },
     resume(s) {
       if (s.host) {
@@ -356,8 +388,8 @@ function p2pNet(config, deliver, onStatus) {
       if (!s?.host) clearRoom();
     },
     wake() {
-      if (peer?.disconnected && !peer.destroyed) peer.reconnect();
-      if (guest && !guest.conn?.open) retry(guest);
+      if (host) for (const url of brokers) if (!host.conns.has(url)) reconnectHostBroker(host, url);
+      if (guest && !guest.searching && !guest.mq?.connected) findHost(guest);
     },
   };
 }

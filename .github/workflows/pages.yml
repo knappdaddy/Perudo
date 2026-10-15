@@ -1,5 +1,5 @@
 # Publishes public/ to the gh-pages branch, which GitHub Pages serves.
-# On Pages the game runs peer-to-peer (see public/config.js), so no server is needed.
+# In relay mode the room host's browser runs the game (see public/config.js), so no server is needed.
 name: Deploy to GitHub Pages
 
 on:

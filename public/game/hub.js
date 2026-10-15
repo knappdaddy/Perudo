@@ -1,6 +1,6 @@
 // Routes messages between connected clients and rooms. Transport-agnostic:
-// the Node server feeds it WebSockets, and in peer-to-peer mode the host's
-// browser feeds it WebRTC data channels. A client is anything shaped like
+// the Node server feeds it WebSockets, and in relay mode the host's
+// browser feeds it messages relayed over MQTT. A client is anything shaped like
 // { send(msg), close(), open }.
 import { Room, GameError } from './room.js';
 
